@@ -15,7 +15,7 @@ import type {
   TuiThemeCurrent,
 } from "@opencode-ai/plugin/tui"
 import { createSignal, Show } from "solid-js"
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -102,8 +102,25 @@ interface ModelSwitchedEventLike {
   timestamp?: number
   sessionID?: string
   data?: { model?: ModelRefLike; timestamp?: number; sessionID?: string }
-  properties?: { model?: ModelRefLike; sessionID?: string }
+  properties?: { model?: ModelRefLike; sessionID?: string; info?: MessageInfoLike }
   model?: ModelRefLike
+}
+
+interface MessageInfoLike {
+  id?: string
+  role?: string
+  summary?: boolean | { title?: string }
+  model?: { providerID?: string; modelID?: string }
+  modelID?: string
+  providerID?: string
+  time?: { created?: number }
+}
+
+interface LocalCounters {
+  user5: number
+  req5: number
+  userW: number
+  reqW: number
 }
 
 /** Narrow cast target: TuiEventBus only types SDK-known event names. */
@@ -112,30 +129,39 @@ interface EventBusLike {
 }
 
 let configPath = join(homedir(), ".config", "opencode", "zai-usage.json")
+const sharedConfigPath = join(homedir(), ".config", "zai-usage.json")
 let modelJsonPath = join(homedir(), ".local", "share", "opencode", "model.json")
+const storageMessageDir = process.env.ZAI_USAGE_STORAGE || join(homedir(), ".local", "share", "opencode", "storage", "message")
 let gApi: TuiPluginApi | undefined
 
-let cfgCache: { cfg: PluginConfig; mtimeMs: number } | undefined
+let cfgCache: { path: string; cfg: PluginConfig; mtimeMs: number } | undefined
 
+/** env → opencode (project-level allowed) → shared cross-tool config. */
 function loadConfig(): PluginConfig {
-  try {
-    const st = statSync(configPath)
-    if (cfgCache && cfgCache.mtimeMs === st.mtimeMs) return cfgCache.cfg
-    const raw = JSON.parse(readFileSync(configPath, "utf8")) as PluginConfig
-    const cfg: PluginConfig = {
-      ...DEFAULT_CONFIG,
-      ...raw,
-      plan: { ...DEFAULT_CONFIG.plan, ...raw.plan },
-      caps: { ...DEFAULT_CONFIG.caps, ...raw.caps },
+  const candidates: string[] = []
+  if (process.env.ZAI_USAGE_CONFIG) candidates.push(process.env.ZAI_USAGE_CONFIG)
+  candidates.push(configPath, sharedConfigPath)
+  for (const path of candidates) {
+    try {
+      const st = statSync(path)
+      if (cfgCache && cfgCache.path === path && cfgCache.mtimeMs === st.mtimeMs) return cfgCache.cfg
+      const raw = JSON.parse(readFileSync(path, "utf8")) as PluginConfig
+      const cfg: PluginConfig = {
+        ...DEFAULT_CONFIG,
+        ...raw,
+        plan: { ...DEFAULT_CONFIG.plan, ...raw.plan },
+        caps: { ...DEFAULT_CONFIG.caps, ...raw.caps },
+      }
+      cfgCache = { cfg, path, mtimeMs: st.mtimeMs }
+      return cfg
+    } catch {
+      // missing/unreadable — try the next candidate
     }
-    cfgCache = { cfg, mtimeMs: st.mtimeMs }
-    return cfg
-  } catch {
-    return {
-      ...DEFAULT_CONFIG,
-      plan: { ...DEFAULT_CONFIG.plan },
-      caps: { ...DEFAULT_CONFIG.caps },
-    }
+  }
+  return {
+    ...DEFAULT_CONFIG,
+    plan: { ...DEFAULT_CONFIG.plan },
+    caps: { ...DEFAULT_CONFIG.caps },
   }
 }
 
@@ -318,16 +344,10 @@ function modelFromRefLike(raw: ModelRefLike | undefined): ModelRef | undefined {
   return { providerID: raw.providerID, modelID: id }
 }
 
-/** Epoch seconds or milliseconds → milliseconds (0 when absent). */
-function toMs(at: number | undefined): number {
-  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return 0
-  return at < 1e12 ? at * 1000 : at
-}
-
 function modelOfMessage(message: unknown): { model?: ModelRef; at: number } {
   const msg = message as { model?: ModelRefLike; time?: { created?: number } }
   // Newest-first scan: an absent timestamp must not lose to model.json noise.
-  const at = toMs(msg?.time?.created) || Number.MAX_SAFE_INTEGER
+  const at = normalizeTs(msg?.time?.created, Number.MAX_SAFE_INTEGER)
   return { model: modelFromRefLike(msg?.model), at }
 }
 
@@ -351,6 +371,238 @@ function readPickerModel(): { model?: ModelRef; mtimeMs: number } | undefined {
     return { model, mtimeMs: st.mtimeMs }
   } catch {
     return undefined
+  }
+}
+
+const [local, setLocal] = createSignal<LocalCounters>({ user5: 0, req5: 0, userW: 0, reqW: 0 })
+
+const counterState = {
+  path: "",
+  fileMtime: -1,
+  fiveReset: 0,
+  weekReset: 0,
+  seenUser: new Map<string, number>(),
+  seenAsst: new Map<string, number>(),
+  saveTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+}
+
+const FIVE_SPAN_MS = 5 * 3_600_000
+const WEEK_SPAN_MS = 7 * 24 * 3_600_000
+const TS_SLACK_MS = 60_000
+
+/**
+ * Epoch s/ms/µs/ns → milliseconds. Future stamps (wrong unit or skewed source)
+ * fall back instead of poisoning every window forever.
+ */
+function normalizeTs(at: number | undefined, fallback: number): number {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return fallback
+  let ms = at
+  if (ms >= 1e17) ms /= 1e6
+  else if (ms >= 1e15) ms /= 1e3
+  else if (ms < 1e12) ms *= 1000
+  if (ms > Date.now() + TS_SLACK_MS) return fallback
+  return ms
+}
+
+/** Reset stamps beyond 8 days out are corrupt — reject. */
+function saneReset(sec: unknown): number {
+  if (typeof sec !== "number" || !Number.isFinite(sec) || sec <= 0) return 0
+  return sec * 1000 <= Date.now() + 8 * 24 * 3_600_000 ? sec : 0
+}
+
+/**
+ * Current window start. Active window spans [reset - span, reset]; once the
+ * reset has passed (stale file, quota not yet refreshed) only post-roll
+ * messages count — never the previous window's.
+ */
+function windowStart(resetSec: number, spanMs: number, now: number): number {
+  if (resetSec <= 0) return now - spanMs
+  const resetMs = resetSec * 1000
+  return now <= resetMs ? resetMs - spanMs : resetMs
+}
+
+function countInWindow(seen: Map<string, number>, resetSec: number, spanMs: number): number {
+  const from = windowStart(resetSec, spanMs, Date.now())
+  let n = 0
+  for (const at of seen.values()) if (at >= from) n++
+  return n
+}
+
+function computeLocal(): LocalCounters {
+  return {
+    user5: countInWindow(counterState.seenUser, counterState.fiveReset, FIVE_SPAN_MS),
+    req5: countInWindow(counterState.seenAsst, counterState.fiveReset, FIVE_SPAN_MS),
+    userW: countInWindow(counterState.seenUser, counterState.weekReset, WEEK_SPAN_MS),
+    reqW: countInWindow(counterState.seenAsst, counterState.weekReset, WEEK_SPAN_MS),
+  }
+}
+
+function publishLocal(): void {
+  setLocal(computeLocal())
+}
+
+function pruneSeen(): void {
+  const now = Date.now()
+  const from = Math.min(windowStart(counterState.fiveReset, FIVE_SPAN_MS, now), windowStart(counterState.weekReset, WEEK_SPAN_MS, now))
+  for (const seen of [counterState.seenUser, counterState.seenAsst]) {
+    for (const [id, at] of seen) if (at < from || at > now + TS_SLACK_MS) seen.delete(id)
+    while (seen.size > 20_000) {
+      const oldest = seen.keys().next().value
+      if (oldest === undefined) break
+      seen.delete(oldest)
+    }
+  }
+}
+
+function mergeCountersFromFile(): void {
+  if (!counterState.path) return
+  let raw: {
+    fiveReset?: number
+    weekReset?: number
+    user?: Array<[string, number]>
+    asst?: Array<[string, number]>
+    seenUser?: string[]
+    seenAsst?: string[]
+  }
+  // Timestamp-less legacy ids and corrupt stamps get the file mtime: their real
+  // time is unknown, and the file was last written in their era. Stamping with
+  // Date.now() would pull every historical id into the current window.
+  let fileMtime = 0
+  try {
+    const st = statSync(counterState.path)
+    if (st.mtimeMs === counterState.fileMtime) return
+    raw = JSON.parse(readFileSync(counterState.path, "utf8"))
+    fileMtime = st.mtimeMs
+    counterState.fileMtime = st.mtimeMs
+  } catch {
+    return
+  }
+  const fiveReset = saneReset(raw.fiveReset)
+  if (fiveReset > counterState.fiveReset) counterState.fiveReset = fiveReset
+  const weekReset = saneReset(raw.weekReset)
+  if (weekReset > counterState.weekReset) counterState.weekReset = weekReset
+  for (const pair of raw.user ?? []) {
+    if (typeof pair?.[0] === "string") counterState.seenUser.set(pair[0], normalizeTs(pair[1], fileMtime))
+  }
+  for (const pair of raw.asst ?? []) {
+    if (typeof pair?.[0] === "string") counterState.seenAsst.set(pair[0], normalizeTs(pair[1], fileMtime))
+  }
+  for (const id of raw.seenUser ?? []) {
+    if (typeof id === "string") counterState.seenUser.set(id, fileMtime)
+  }
+  for (const id of raw.seenAsst ?? []) {
+    if (typeof id === "string") counterState.seenAsst.set(id, fileMtime)
+  }
+  publishLocal()
+}
+
+function backfillCountersFromStorage(): void {
+  let sessions: string[] = []
+  try {
+    sessions = readdirSync(storageMessageDir)
+  } catch {
+    return
+  }
+  const cutoff = Date.now() - 8 * 24 * 3_600_000
+  for (const session of sessions) {
+    let files: string[] = []
+    try {
+      files = readdirSync(join(storageMessageDir, session))
+    } catch {
+      continue
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue
+      const full = join(storageMessageDir, session, file)
+      try {
+        if (statSync(full).mtimeMs < cutoff) continue
+        countMessage(JSON.parse(readFileSync(full, "utf8")) as MessageInfoLike)
+      } catch {
+        // unreadable entry — skip
+      }
+    }
+  }
+  flushCounters()
+}
+
+function writeCounters(): void {
+  if (!counterState.path) return
+  mergeCountersFromFile()
+  pruneSeen()
+  publishLocal()
+  try {
+    const payload = {
+      v: 2,
+      fiveReset: counterState.fiveReset,
+      weekReset: counterState.weekReset,
+      user: [...counterState.seenUser],
+      asst: [...counterState.seenAsst],
+    }
+    const tmp = `${counterState.path}.${process.pid}.tmp`
+    mkdirSync(dirname(counterState.path), { recursive: true })
+    writeFileSync(tmp, JSON.stringify(payload))
+    renameSync(tmp, counterState.path)
+    counterState.fileMtime = statSync(counterState.path).mtimeMs
+  } catch {
+    // counters are best-effort
+  }
+}
+
+function scheduleCountersSave(): void {
+  if (counterState.saveTimer) return
+  counterState.saveTimer = setTimeout(() => {
+    counterState.saveTimer = undefined
+    writeCounters()
+  }, 500)
+}
+
+function flushCounters(): void {
+  if (counterState.saveTimer) {
+    clearTimeout(counterState.saveTimer)
+    counterState.saveTimer = undefined
+  }
+  writeCounters()
+}
+
+function loadCounters(path: string): void {
+  counterState.path = path
+  if (!existsSync(path)) backfillCountersFromStorage()
+  mergeCountersFromFile()
+}
+
+function countMessage(info: MessageInfoLike): void {
+  if (typeof info.id !== "string" || info.id === "" || typeof info.role !== "string") return
+  if (info.summary === true || (typeof info.summary === "object" && info.summary !== null)) return
+  const rawModel = info.model ?? { providerID: info.providerID, modelID: info.modelID }
+  const model =
+    typeof rawModel?.providerID === "string" && typeof rawModel?.modelID === "string"
+      ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
+      : undefined
+  if (!model || !isPlanModel(model, loadConfig())) return
+  const seen = info.role === "user" ? counterState.seenUser : info.role === "assistant" ? counterState.seenAsst : undefined
+  if (!seen || seen.has(info.id)) return
+  mergeCountersFromFile()
+  if (seen.has(info.id)) return
+  seen.set(info.id, normalizeTs(info.time?.created, Date.now()))
+  publishLocal()
+  scheduleCountersSave()
+}
+
+function syncCounters(five: QuotaWindow, week: QuotaWindow): void {
+  let changed = false
+  const fiveReset = saneReset(five.reset)
+  if (fiveReset > counterState.fiveReset) {
+    counterState.fiveReset = fiveReset
+    changed = true
+  }
+  const weekReset = saneReset(week.reset)
+  if (weekReset > counterState.weekReset) {
+    counterState.weekReset = weekReset
+    changed = true
+  }
+  if (changed) {
+    publishLocal()
+    scheduleCountersSave()
   }
 }
 
@@ -398,6 +650,11 @@ function fmtCount(value: number, unit: Unit): string {
   return String(Math.round(value))
 }
 
+function usedLabel(window: QuotaWindow): string {
+  const n = fmtCount(window.used, window.unit)
+  return window.absolute ? n : `~${n}`
+}
+
 function fmtRemaining(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000))
   const days = Math.floor(total / 86400)
@@ -432,6 +689,7 @@ function CompactStatus(props: {
   context: TuiSlotContext
   snap: () => Snapshot | undefined
   visible: () => boolean
+  local: () => LocalCounters
 }) {
   const theme = () => props.context.theme.current
   return (
@@ -444,13 +702,17 @@ function CompactStatus(props: {
           <box flexDirection="row" gap={1}>
             <text fg={theme().textMuted}>5h:</text>
             <text fg={pctColor(theme(), snap().five.pct)}>
-              {fmtCount(snap().five.used, snap().five.unit)}/{fmtCount(snap().five.cap, snap().five.unit)}
+              {usedLabel(snap().five)}/{fmtCount(snap().five.cap, snap().five.unit)} ({Math.round(snap().five.pct)}
+              %)
             </text>
             <text fg={theme().textMuted}>·</text>
             <text fg={theme().textMuted}>Wk:</text>
             <text fg={pctColor(theme(), snap().week.pct)}>
-              {fmtCount(snap().week.used, snap().week.unit)}/{fmtCount(snap().week.cap, snap().week.unit)}
+              {usedLabel(snap().week)}/{fmtCount(snap().week.cap, snap().week.unit)} ({Math.round(snap().week.pct)}
+              %)
             </text>
+            <text fg={theme().textMuted}>·</text>
+            <text fg={theme().textMuted}>{props.local().user5}↑</text>
           </box>
         )}
       </Show>
@@ -462,6 +724,7 @@ function SidebarPanel(props: {
   context: TuiSlotContext
   snap: () => Snapshot | undefined
   visible: () => boolean
+  local: () => LocalCounters
 }) {
   const theme = () => props.context.theme.current
   const title = () => {
@@ -493,7 +756,7 @@ function SidebarPanel(props: {
       <box flexDirection="row">
         <text fg={theme().textMuted}>{label}</text>
         <text fg={pctColor(theme(), window().pct)}>
-          {fmtCount(window().used, window().unit)} / {fmtCount(window().cap, window().unit)}
+          {usedLabel(window())} / {fmtCount(window().cap, window().unit)} ({Math.round(window().pct)}%)
         </text>
         <text fg={theme().textMuted}>{unitLabel()}</text>
       </box>
@@ -520,6 +783,19 @@ function SidebarPanel(props: {
             <box flexDirection="column" width="100%">
               {row("5h:  ", () => snap().five)}
               {row("Week: ", () => snap().week)}
+              <box flexDirection="row">
+                <text fg={theme().textMuted}>Req:  </text>
+                <text fg={theme().textMuted}>
+                  {props.local().req5} 5h / {props.local().reqW} wk
+                </text>
+              </box>
+              <box flexDirection="row">
+                <text fg={theme().textMuted}>User: </text>
+                <text fg={theme().textMuted}>
+                  {props.local().user5} 5h / {props.local().userW} wk
+                </text>
+                <text fg={theme().textMuted}> local</text>
+              </box>
               <box width="100%">
                 <text fg={theme().textMuted} selectable={false}>
                   {footer()}
@@ -542,7 +818,10 @@ function resolveConfigPath(path: { config?: string } | undefined): string {
 const tui: TuiPlugin = async (api: TuiPluginApi) => {
   gApi = api
   configPath = process.env.ZAI_USAGE_CONFIG || resolveConfigPath(api.state.path)
-  if (api.state.path?.state) modelJsonPath = join(api.state.path.state, "model.json")
+  if (api.state.path?.state) {
+    modelJsonPath = join(api.state.path.state, "model.json")
+    loadCounters(join(api.state.path.state, "zai-usage-counters.json"))
+  }
 
   const [snap, setSnap] = createSignal<Snapshot | undefined>(undefined)
   let disposed = false
@@ -555,7 +834,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         bus.on(type, (event) => {
           const model = modelFromRefLike(event?.data?.model ?? event?.properties?.model ?? event?.model)
           if (!model) return
-          const at = toMs(event?.data?.timestamp ?? event?.created ?? event?.timestamp) || Date.now()
+          const at = normalizeTs(event?.data?.timestamp ?? event?.created ?? event?.timestamp, Date.now())
           const sessionID = event?.data?.sessionID ?? event?.sessionID
           setSelected({ model, at, sessionID: typeof sessionID === "string" ? sessionID : undefined })
         }),
@@ -567,11 +846,24 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   trackSelection("session.model.selected")
   trackSelection("session.next.model.switched")
 
+  try {
+    unsubscribers.push(
+      bus.on("message.updated", (event) => {
+        const info = event?.properties?.info
+        if (info) countMessage(info)
+      }),
+    )
+  } catch {
+    // this TUI build does not emit the event — skip
+  }
+
   const refresh = async (force = false): Promise<void> => {
     try {
       const result = await loadQuota(force)
       if (disposed) return
-      setSnap(result ? toSnapshot(result) : undefined)
+      const snapshot = result ? toSnapshot(result) : undefined
+      if (snapshot) syncCounters(snapshot.five, snapshot.week)
+      setSnap(snapshot)
     } catch {
       if (!disposed) setSnap(undefined)
     }
@@ -587,12 +879,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const ticker = setInterval(() => {
     if (disposed) return
     setNow(Date.now())
+    mergeCountersFromFile()
   }, 1000)
   api.lifecycle.onDispose(() => {
     disposed = true
     clearInterval(interval)
     clearInterval(poller)
     clearInterval(ticker)
+    flushCounters()
     for (const off of unsubscribers) {
       try {
         off()
@@ -617,7 +911,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const describe = (window: QuotaWindow): string => {
       const reset = window.reset ? `, resets ${new Date(window.reset * 1000).toLocaleString()}` : ""
       const unit = window.unit === "prompts" ? "prompts" : window.unit
-      return `${fmtCount(window.used, window.unit)} / ${fmtCount(window.cap, window.unit)} ${unit} (${Math.round(window.pct)}%)${reset}`
+      return `${usedLabel(window)} / ${fmtCount(window.cap, window.unit)} ${unit} (${Math.round(window.pct)}%)${reset}`
     }
     const exhausted = isExhausted(current.five) || isExhausted(current.week)
     api.ui.toast({
@@ -628,6 +922,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       message: [
         `5h:   ${describe(current.five)}`,
         `Week: ${describe(current.week)}`,
+        `Local: ${local().user5} user / ${local().req5} req (5h) · ${local().userW} / ${local().reqW} (week)`,
         `Updated ${new Date(current.fetchedAt).toLocaleTimeString()}${
           current.kind === "prompts" ? " · counts derived from percentage" : ""
         }`,
@@ -651,15 +946,15 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     order: 50,
     slots: {
       session_prompt_right(context, props) {
-        return <CompactStatus context={context} snap={snap} visible={visibleFor(props.session_id)} />
+        return <CompactStatus context={context} snap={snap} visible={visibleFor(props.session_id)} local={local} />
       },
       // home_footer is single_winner (owned by the built-in status line) and
       // home_prompt_right squeezes the composer row into a wrap — own line wins.
       home_bottom(context) {
-        return <CompactStatus context={context} snap={snap} visible={visibleFor()} />
+        return <CompactStatus context={context} snap={snap} visible={visibleFor()} local={local} />
       },
       sidebar_content(context, props) {
-        return <SidebarPanel context={context} snap={snap} visible={visibleFor(props.session_id)} />
+        return <SidebarPanel context={context} snap={snap} visible={visibleFor(props.session_id)} local={local} />
       },
     },
   })
