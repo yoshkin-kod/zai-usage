@@ -1,10 +1,15 @@
 {
-  "name": "opencode-zai-usage",
-  "private": true,
+  "name": "zai-usage",
+  "version": "1.0.0",
+  "description": "Z.AI coding plan usage plugins: OpenCode TUI plugin, pi extension, Claude Code status line",
   "license": "MIT",
   "type": "module",
+  "repository": "github:yoshkin-kod/zai-usage",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": ["./pi/zai-usage.ts"]
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.4.3",

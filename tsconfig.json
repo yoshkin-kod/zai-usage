@@ -13,5 +13,5 @@
     "types": ["node"],
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["opencode-zai-usage.tsx"]
+  "include": ["opencode/opencode-zai-usage.tsx", "pi/zai-usage.ts"]
 }
